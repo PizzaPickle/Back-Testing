@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import numpy as np
 from typing import List, Union
+import yfinance as yf
 
 #주식 종목 코드(code)에 대해서 최초 상장일(origintime)을 가져옴 , 언제부터 백테스팅 돌릴지 체크
 #네이버 금융 주식 데이터 사용
@@ -57,6 +58,29 @@ def get_stock_data(code, from_date, to_date):
     except Exception:
         raise Exception(f"Failed to fetch data for stock code {code}")
 
+# 해외 주식 데이터 가져오기 (Yahoo Finance 사용)
+def get_stock_data_yahoo(code, from_date, to_date, exchange_rate=1350):
+    try:
+        df = yf.download(code, start=from_date, end=to_date)
+        if df.empty:
+            raise ValueError(f"No data found for stock code {code} in the given date range")
+        
+        df.reset_index(inplace=True)
+        df['date'] = pd.to_datetime(df['Date'])
+        df = df[['date', 'Open', 'High', 'Low', 'Close', 'Volume']].rename(
+            columns={'Open': 'price', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'vol'}
+        )
+        df.set_index('date', inplace=True)
+        # 고정 환율을 사용하여 가격을 원화로 변환
+        df['close'] = df['close'] * exchange_rate
+        df['price'] = df['price'] * exchange_rate
+        df['high'] = df['high'] * exchange_rate
+        df['low'] = df['low'] * exchange_rate
+        
+        return df
+    
+    except Exception as e:
+        raise ValueError(f"Failed to fetch data for stock code {code} from Yahoo Finance: {str(e)}")
 
 #리밸런싱 용 코드. 비율에 맞춰 주식을 매수하거나 매도 처리
 def buy_stock(money, stock_price, last_stock_num, stock_rate):
@@ -139,33 +163,59 @@ def calculate_sharpe_ratio_and_std(df, risk_free_rate=0.03):
 
     return round(sharpe_ratio, 2), round(annual_std_dev * 100, 2), round(annual_return, 2)
 
+# 날짜 형식을 변환하는 함수
+def convert_date_format(date_str):
+    return datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+
+# 국내 및 해외 주식 구분 및 데이터 가져오기
+def get_stock_data_combined(code, from_date, to_date, is_foreign="false"):
+    if is_foreign == "true":
+        # 날짜 형식을 '%Y-%m-%d'로 변환
+        from_date = convert_date_format(from_date)
+        to_date = convert_date_format(to_date)
+        return get_stock_data_yahoo(code, from_date, to_date) # 해외 주식의 경우
+    else:
+        return get_stock_data(code, from_date, to_date)
+
 def back_test_portfolio(money: int, interval: int, start_day: str, end_day: str, stock_list, start_from_latest_stock: str):
     total_invest_money = money
 
     stock_code = []
     stock_name = []
     stock_ratio = []
+    is_foreign_list = []
 
     for sss in stock_list:
         stock_code.append(sss[0])
         stock_name.append(sss[1])
         stock_ratio.append(sss[2])
+        is_foreign_list.append(sss[3])  # 국내 주식은 "false", 해외 주식은 "true"
 
     if sum(stock_ratio) > 1:
         raise Exception("Sum of ratios is greater than 1.0")
 
-    first_date = 0
-    for i in stock_code:
-        org_time = get_stock_origintime(i)
-        if start_from_latest_stock == "true":
-            if first_date == 0 or first_date < org_time:
-                first_date = org_time
-        else:
-            if first_date == 0 or first_date > org_time:
-                first_date = org_time
-
-    if first_date > start_day:
+    first_date = None
+    for i in range(len(stock_code)):
+        if is_foreign_list[i] == "false":  # 국내 주식만 체크
+            org_time = get_stock_origintime(stock_code[i])
+            if start_from_latest_stock == "true":
+                if first_date is None or first_date < org_time:
+                    first_date = org_time
+            else:
+                if first_date is None or first_date > org_time:
+                    first_date = org_time
+    # for i in stock_code:
+    #     org_time = get_stock_origintime(i)
+    #     if start_from_latest_stock == "true":
+    #         if first_date == 0 or first_date < org_time:
+    #             first_date = org_time
+    #     else:
+    #         if first_date == 0 or first_date > org_time:
+    #             first_date = org_time
+    if first_date is not None and int(first_date) > int(start_day):
         start_day = first_date
+    # if first_date > start_day:
+    #     start_day = first_date
 
     start_date = datetime.strptime(start_day, '%Y%m%d')
     cal_days = (datetime.strptime(end_day, "%Y%m%d") - start_date).days
@@ -173,7 +223,7 @@ def back_test_portfolio(money: int, interval: int, start_day: str, end_day: str,
     df = pd.DataFrame()
 
     for i in range(len(stock_code)):
-        df_close = get_stock_data(stock_code[i], start_day, end_day)['close']
+        df_close = get_stock_data_combined(stock_code[i], start_day, end_day, is_foreign_list[i])['close']
         df_close = df_close.rename(stock_name[i])
         df_close.index = pd.to_datetime(df_close.index)
         df_close = get_month_end_data(df_close)
@@ -183,7 +233,8 @@ def back_test_portfolio(money: int, interval: int, start_day: str, end_day: str,
     df.fillna(0, inplace=True)
 
     if start_from_latest_stock == "true":
-        latest_start_date = max(pd.to_datetime([get_stock_origintime(code) for code in stock_code]))
+        latest_start_date = max(pd.to_datetime([get_stock_origintime(code) for code, is_foreign in zip(stock_code, is_foreign_list) if is_foreign == "false"]))
+        # latest_start_date = max(pd.to_datetime([get_stock_origintime(code) for code in stock_code]))
         df = df[df.index >= latest_start_date]
 
     rebalanceing_date_list = []
@@ -303,9 +354,10 @@ class Stock(BaseModel):
     code: str
     name: str
     ratio: float
+    is_foreign: str # 해외 주식 여부를 "true" 또는 "false"로
 
 class Portfolio(BaseModel):
-    stock_list: List[Union[List[Union[str, float]], Stock]]
+    stock_list: List[Union[List[Union[str, float, str]], Stock]]
     balance: int
     interval_month: int
     start_date: str
