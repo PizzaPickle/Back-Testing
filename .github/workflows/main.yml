@@ -19,7 +19,7 @@ jobs:
     - name: Set up SSH
       uses: webfactory/ssh-agent@v0.5.3
       with:
-        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        ssh-private-key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
 
     # EC2 인스턴스의 호스트 키를 known_hosts에 추가 (보안 강화를 위해 권장)
     - name: Add EC2 to known hosts
