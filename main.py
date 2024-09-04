@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import numpy as np
-from typing import List, Union
+from typing import List, Union, Dict
 import yfinance as yf
 
 #주식 종목 코드(code)에 대해서 최초 상장일(origintime)을 가져옴 , 언제부터 백테스팅 돌릴지 체크
@@ -82,6 +82,9 @@ def get_stock_data_yahoo(code, from_date, to_date, exchange_rate=1350):
     except Exception as e:
         raise ValueError(f"Failed to fetch data for stock code {code} from Yahoo Finance: {str(e)}")
 
+##############################
+# 주식 매수 처리
+##############################
 #리밸런싱 용 코드. 비율에 맞춰 주식을 매수하거나 매도 처리
 def buy_stock(money, stock_price, last_stock_num, stock_rate):
     if stock_price == 0:
@@ -127,7 +130,9 @@ def buy_stock_more(money, stock_price, last_stock_num, stock_rate):
 
     return money, stock_num, stock_money
 
-#주식명,가격,비율을 받아서 가격에 대해 비율을 재 조정
+##############################
+# 주식명, 가격, 비율에 대해 비율 재조정
+##############################
 def get_ratio(names, prices, ratios):
     total_ratio = 0
     new_ratios = []
@@ -143,11 +148,17 @@ def get_ratio(names, prices, ratios):
 
     return new_ratios
 
+##############################
+# 월말 데이터 추출
+##############################
 #월말 데이터 추출(왜 인지 resample을 'M'말고 'ME'로 잡으라고 나옴)
 def get_month_end_data(df):
     df.index = pd.to_datetime(df.index)
     return df.resample('ME').last()
 
+##############################
+# 샤프 비율, 연간 표준편차, 연간 수익률 계산
+##############################
 #df와 무위험 이자율 데이터로 샤프비율,표준편차(std),연간 수익률 계산
 def calculate_sharpe_ratio_and_std(df, risk_free_rate=0.03):
     df.index = pd.to_datetime(df.index)
@@ -204,14 +215,7 @@ def back_test_portfolio(money: int, interval: int, start_day: str, end_day: str,
             else:
                 if first_date is None or first_date > org_time:
                     first_date = org_time
-    # for i in stock_code:
-    #     org_time = get_stock_origintime(i)
-    #     if start_from_latest_stock == "true":
-    #         if first_date == 0 or first_date < org_time:
-    #             first_date = org_time
-    #     else:
-    #         if first_date == 0 or first_date > org_time:
-    #             first_date = org_time
+   
     if first_date is not None and int(first_date) > int(start_day):
         start_day = first_date
     # if first_date > start_day:
@@ -314,28 +318,21 @@ def calculate_mdd(df):
 def back_test(stock_info):
     #포트폴리오 객체
     portfolio = stock_info['portfolio']
-    
     # 백테스팅 시점 결정
     # 값이 true일 경우 가장 늦게 상장 된 주식의 상장일 기준으로 백테스팅 시작.
     # 값이 false일 경우 가장 먼저 상장 된 주식의 상장일 기준으로 백테스팅 시작.
     # 현재는 false이므로 먼저 상장된 기준으로 백테스팅하고, 그때 당시 안되있으면 반영이 안됨. (값 0 으로 처리)
     start_from_latest_stock = stock_info['start_from_latest_stock']
-
     #주식 목록 (종목코드,주식이름,포트폴리오 비율)
     stock_list = portfolio['stock_list']
-
     #초기 투자 총 금액
     balance = portfolio['balance']
-
     #리밸런싱 단위 (개월) ex) interval=1 은 1달마다 리밸런싱을 함을 의미합니다.
     interval = portfolio['interval_month']
-
     #백테스팅 시작일자
     start_date = portfolio['start_date']
-    
     #백테스팅 끝일자
     end_date = portfolio['end_date']
-
     #백테스트 실행
     final_df, final_df_dict, sharpe_ratio, annual_std_dev, annual_return, total_balance = back_test_portfolio(balance, interval, start_date, end_date, stock_list, start_from_latest_stock)
 
@@ -365,7 +362,7 @@ class Portfolio(BaseModel):
 
 class BackTestRequest(BaseModel):
     start_from_latest_stock: str
-    portfolio: Portfolio
+    portfolio: Portfolio 
 
 @app.post("/backtest/")
 async def run_backtest(request: BackTestRequest):
@@ -376,6 +373,76 @@ async def run_backtest(request: BackTestRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+#####################
+# 자산군 통합
+#####################
+class PortfolioResult(BaseModel):
+    backtest: Dict[str, float]  # 날짜별 수익률
+    sharpe_ratio: float
+    standard_deviation: float
+    annual_return: float
+    total_balance: float
+    mdd: float
+
+class AssetGroup(BaseModel):
+    name: str  # 자산군 이름 (예: 국내, 해외)
+    ratio: float  # 자산군 비율 (예: 0.6, 0.4)
+    portfolio_result: PortfolioResult  # 백테스트 결과 (각 자산군에서 얻은 데이터)
+
+class IntegratedPortfolioRequest(BaseModel):
+    asset_groups: List[AssetGroup]  # 자산군 리스트
+
+# 통합 백테스트 계산 함수
+def calculate_weighted_results(asset_groups: List[AssetGroup]):
+    weighted_portfolio = pd.DataFrame()
+
+    for asset_group in asset_groups:
+        try:
+            # 'backtest' 존재 여부 확인 및 접근
+            if hasattr(asset_group.portfolio_result, 'backtest'):
+                portfolio_data = pd.Series(asset_group.portfolio_result.backtest)
+                weighted_data = portfolio_data * asset_group.ratio
+            else:
+                raise ValueError(f"Missing 'backtest' in portfolio_result for asset group {asset_group.name}")
+
+            if weighted_portfolio.empty:
+                weighted_portfolio = weighted_data
+            else:
+                weighted_portfolio = weighted_portfolio.add(weighted_data, fill_value=0)
+
+        except Exception as e:
+            print(f"Error processing asset group {asset_group.name}: {str(e)}")
+            raise e
+
+    # 통합 포트폴리오 계산
+    weighted_portfolio_df = weighted_portfolio.to_frame(name="backtest")
+    sharpe_ratio, annual_std_dev, annual_return = calculate_sharpe_ratio_and_std(weighted_portfolio_df)
+    mdd = calculate_mdd(weighted_portfolio_df)
+
+    return {
+        'integrated_portfolio': {
+            'backtest': weighted_portfolio.to_dict(),
+            'sharpe_ratio': sharpe_ratio,
+            'standard_deviation': annual_std_dev,
+            'annual_return': annual_return,
+            'mdd': mdd
+        }
+    }
+
+@app.post("/backtest/integrated")
+async def run_integrated_backtest(request: IntegratedPortfolioRequest):
+    try:
+        # 입력 데이터를 백테스트 함수가 처리할 수 있도록 변환
+        asset_groups = request.asset_groups
+        
+        # 자산군 별 백테스트 결과를 기반으로 통합 백테스트 계산
+        result = calculate_weighted_results(asset_groups)
+        return result
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 
 # 만약 해당 코드가 main.py로 저장되었다면, 다음 명령어로 실행합니다.
 # uvicorn main:app --reload
